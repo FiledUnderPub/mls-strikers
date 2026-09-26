@@ -1,0 +1,17 @@
+# R
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.nb.html
+
+# Private — not for publication
+render.R
+drafts/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Publishing tracker (private)
+post.yml

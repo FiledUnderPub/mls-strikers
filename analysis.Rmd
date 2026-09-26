@@ -1,0 +1,1163 @@
+---
+title: "Filed Under: MLS strikers"
+output: html_notebook
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(rstatix)
+library(scales)
+library(ggrepel)
+library(kableExtra)
+
+fu_table <- function(df, ...) {
+  df %>%
+    knitr::kable(...) %>%
+    kable_styling(
+      bootstrap_options = "condensed",
+      full_width        = FALSE,
+      position          = "left",
+      font_size         = 13
+    ) %>%
+    row_spec(0, bold = TRUE, color = "#282828", background = "#ECECEC")
+}
+
+conf_colors <- c(East = "#007bc6", West = "#69279b")
+```
+
+
+## Data
+
+American Soccer Analysis (ASA), public API v1.
+Downloaded 2026-09-25. MLS 2025 regular season (22 February – 18 October 2025,
+510 matches).
+
+Query parameters:
+- `season_name = 2025`, `stage_name = Regular Season`
+- `/players/xgoals`, all shots and penalties only, not split by team
+- `/players/xgoals`, split by team, used to assign each player a primary team
+- `/players/goals-added`, not split by team
+
+> American Soccer Analysis. *ASA API v1: MLS player xGoals and Goals Added,
+> 2025 Regular Season.* https://app.americansocceranalysis.com/api/v1/.
+> Accessed 25 September 2026.
+
+`data-prep.R` keeps players whose most common position in 2025 was striker
+(`ST`), winger (`W`), or attacking midfielder (`AM`), and adds conference from
+the 2025 alignment (15 teams each).
+
+Variables:
+- `position` — ASA general position: most common position played over the season
+- `team`, `conference` — team with the most minutes played, and its conference
+- `n_teams` — number of MLS teams played for in 2025
+- `minutes` — regular-season minutes played
+- `shots`, `shots_on_target`, `goals` — all shots, including penalties
+- `xg` — expected goals: summed probability that each shot scores, from ASA's shot model
+- `pen_shots`, `pen_goals`, `pen_xg` — the penalty subset of the above
+- `key_passes`, `assists`, `xa` — passes leading to a shot, primary assists, and expected assists
+- `g_plus` — ASA goals added (g+) above positional average, summed over all action types
+
+```{r load}
+raw <- readr::read_csv("data/mls-attackers-2025.csv", show_col_types = FALSE)
+
+cat(sprintf("Dataset: %d observations, %d variables\n", nrow(raw), ncol(raw)))
+```
+
+Derived measures. Non-penalty figures remove penalty kicks, which are taken by
+whoever the team designates and carry a near-fixed xG of about 0.78.
+Age is measured at the season opener.
+
+```{r derive}
+attackers <- raw %>%
+  mutate(
+    npg      = goals - pen_goals,
+    npxg     = xg - pen_xg,
+    np_shots = shots - pen_shots,
+    n90      = minutes / 90,
+    g90      = goals / n90,
+    npg90    = npg / n90,
+    npxg90   = npxg / n90,
+    conv     = npg / np_shots,
+    sot_pct  = shots_on_target / shots,
+    age      = floor(as.numeric(as.Date("2025-02-22") - birth_date) / 365.25)
+  )
+```
+
+
+## Completeness checks
+
+Per-90 rates from a few hundred minutes are unstable. A striker who scores once
+in 150 minutes has a rate of 0.60 per 90, the same as a 20-goal season.
+
+```{r completeness}
+attackers %>%
+  filter(position == "ST") %>%
+  mutate(band = cut(minutes, c(0, 450, 900, 1800, 2700, Inf),
+                    labels = c("< 450", "450–899", "900–1,799", "1,800–2,699", "2,700+"),
+                    right = FALSE)) %>%
+  group_by(band) %>%
+  summarise(strikers = n(), goals = sum(goals)) %>%
+  mutate(share_of_goals = percent(goals / sum(goals), accuracy = 1)) %>%
+  fu_table(col.names = c("Minutes", "Strikers", "Goals", "Share of striker goals"))
+```
+
+Threshold: 900 minutes (ten full matches, about 30% of a 3,060-minute season).
+This is applied to every ranking and test below. Season-total top-ten lists are
+unaffected by it, since no striker under 900 minutes reached the top ten.
+
+```{r filter}
+MIN_MINUTES <- 900
+
+strikers <- attackers %>%
+  filter(position == "ST", minutes >= MIN_MINUTES)
+
+strikers %>%
+  count(conference) %>%
+  fu_table(col.names = c("Conference", "Strikers, 900+ minutes"))
+```
+
+Qualifying strikers who played for more than one team in 2025 are counted once,
+under the team where they played more minutes.
+
+```{r multi-team}
+strikers %>%
+  filter(n_teams > 1) %>%
+  select(player, team, conference, minutes) %>%
+  fu_table(col.names = c("Player", "Primary team", "Conference", "Minutes"))
+```
+
+
+## Who counts as a striker
+
+ASA assigns each player the position they played most often. Several of the
+league's leading scorers are classified as wingers or attacking midfielders.
+They are excluded from the striker rankings but shown here for reference.
+
+```{r non-strikers}
+attackers %>%
+  filter(position != "ST", minutes >= MIN_MINUTES, goals >= 13) %>%
+  arrange(desc(goals)) %>%
+  select(player, position, team, goals, npg) %>%
+  fu_table(col.names = c("Player", "ASA position", "Team", "Goals", "Non-penalty goals"))
+```
+
+
+## Top ten strikers
+
+Ranked by goals, with ties broken by assists and then by fewer minutes (the
+MLS Golden Boot tiebreakers).
+
+```{r top10-fn}
+top_ten <- function(df) {
+  df %>%
+    arrange(desc(goals), desc(assists), minutes) %>%
+    slice_head(n = 10) %>%
+    mutate(rank = row_number()) %>%
+    transmute(
+      rank, player, team,
+      minutes = comma(minutes),
+      goals, npg,
+      sot     = shots_on_target,
+      xg      = round(xg, 1),
+      npxg    = round(npxg, 1),
+      g90     = number(g90, accuracy = 0.01),
+      npxg90  = number(npxg90, accuracy = 0.01),
+      assists
+    )
+}
+
+top10_cols <- c("#", "Player", "Team", "Min", "G", "npG", "SoT",
+                "xG", "npxG", "G/90", "npxG/90", "A")
+```
+
+### Overall
+
+```{r top10-overall}
+strikers %>% top_ten() %>% fu_table(col.names = top10_cols)
+```
+
+### Eastern Conference
+
+```{r top10-east}
+strikers %>% filter(conference == "East") %>% top_ten() %>% fu_table(col.names = top10_cols)
+```
+
+### Western Conference
+
+```{r top10-west}
+strikers %>% filter(conference == "West") %>% top_ten() %>% fu_table(col.names = top10_cols)
+```
+
+### Beyond scoring
+
+Chance creation and total on-ball value for the overall top ten. g+ is ASA's
+goals added above the positional average, summed across passing, receiving,
+dribbling, shooting, interrupting, and fouling.
+
+```{r top10-creation}
+strikers %>%
+  arrange(desc(goals), desc(assists), minutes) %>%
+  slice_head(n = 10) %>%
+  transmute(player, key_passes, assists,
+            xa     = round(xa, 1),
+            g_plus = round(g_plus, 1)) %>%
+  fu_table(col.names = c("Player", "Key passes", "Assists", "xA", "g+"))
+```
+
+Eight of the overall top ten played in the East. The tables below check whether
+that holds beyond the top ten.
+
+
+## Statistical tests
+
+### Measures
+
+Eight per-player rates, all among the 55 qualifying strikers.
+
+```{r stat-measures}
+strikers <- strikers %>%
+  mutate(np_shots90    = np_shots / n90,
+         npxg_per_shot = npxg / np_shots,
+         diff90        = npg90 - npxg90)
+
+measure_labels <- c(
+  g90           = "Goals per 90",
+  npg90         = "Non-penalty goals per 90",
+  npxg90        = "Non-penalty xG per 90",
+  np_shots90    = "Non-penalty shots per 90",
+  npxg_per_shot = "xG per shot",
+  conv          = "Conversion (npG / np shots)",
+  sot_pct       = "Shots on target %",
+  diff90        = "npG minus npxG, per 90"
+)
+
+strikers_long <- strikers %>%
+  select(player, team, conference, all_of(names(measure_labels))) %>%
+  pivot_longer(all_of(names(measure_labels)), names_to = "measure") %>%
+  mutate(measure = factor(measure, levels = names(measure_labels)))
+```
+
+```{r normality-check}
+strikers_long %>%
+  group_by(measure, conference) %>%
+  shapiro_test(value) %>%
+  mutate(measure   = measure_labels[as.character(measure)],
+         statistic = number(statistic, accuracy = 0.001),
+         p         = number(p, accuracy = 0.001)) %>%
+  select(measure, conference, statistic, p) %>%
+  fu_table(col.names = c("Measure", "Conference", "W", "p"))
+```
+
+Three East measures (npG/90, conversion, and npG minus npxG) depart from
+normality, so rank-based tests are used throughout.
+
+
+### East vs. West
+
+Two-sided Wilcoxon rank-sum test per measure, East (n = 28) vs. West
+(n = 27). P-values adjusted with Benjamini–Hochberg across the eight measures.
+Effect size r = Z / √n (0.1 small, 0.3 moderate, 0.5 large).
+
+```{r wilcoxon}
+conf_medians <- strikers_long %>%
+  group_by(measure, conference) %>%
+  summarise(median = median(value), .groups = "drop") %>%
+  pivot_wider(names_from = conference, values_from = median)
+
+conf_tests <- strikers_long %>%
+  group_by(measure) %>%
+  wilcox_test(value ~ conference) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance(p.col = "p.adj")
+
+conf_effects <- strikers_long %>%
+  group_by(measure) %>%
+  wilcox_effsize(value ~ conference) %>%
+  select(measure, effsize, magnitude)
+
+conf_results <- conf_medians %>%
+  left_join(conf_tests, by = "measure") %>%
+  left_join(conf_effects, by = "measure")
+
+conf_results %>%
+  mutate(measure = measure_labels[as.character(measure)],
+         across(c(East, West), ~ number(.x, accuracy = 0.01)),
+         across(c(p, p.adj), ~ pvalue(.x, accuracy = 0.001)),
+         effsize = number(effsize, accuracy = 0.01)) %>%
+  select(measure, East, West, statistic, p, p.adj, p.adj.signif, effsize, magnitude) %>%
+  fu_table(col.names = c("Measure", "East median", "West median", "W", "p",
+                         "p.adj (BH)", "", "r", "Magnitude"))
+```
+
+No measure differs between conferences after correction (all p.adj ≥ 0.32),
+and every effect size is small. The East's hold on the top ten is not matched
+by a difference in the typical striker.
+
+
+### Age and scoring rate
+
+```{r age-test}
+strikers %>%
+  cor_test(age, npg90, method = "spearman") %>%
+  mutate(p = number(p, accuracy = 0.001)) %>%
+  select(var1, var2, cor, p) %>%
+  fu_table(col.names = c("Variable", "Variable", "Spearman rho", "p"))
+```
+
+```{r age-oldest}
+strikers %>%
+  arrange(desc(age)) %>%
+  slice_head(n = 5) %>%
+  mutate(npg_rank = min_rank(desc(strikers$npg))[match(player, strikers$player)]) %>%
+  select(player, team, age, npg, npg_rank) %>%
+  fu_table(col.names = c("Player", "Team", "Age", "npG", "npG rank (of 55)"))
+```
+
+
+### Players vs. their conference and the league
+
+Two approaches, following earlier Filed Under posts.
+
+**Descriptive: IQR outliers.** Values beyond 1.5× the interquartile range from
+the quartiles are outliers; beyond 3× are extreme outliers (`rstatix`
+defaults). Run league-wide and within each conference, for every measure.
+
+```{r player-outliers}
+outliers_league <- strikers_long %>%
+  group_by(measure) %>%
+  mutate(group_median = median(value)) %>%
+  identify_outliers(value) %>%
+  ungroup() %>%
+  mutate(scope = "League")
+
+outliers_conf <- strikers_long %>%
+  group_by(conference, measure) %>%
+  mutate(group_median = median(value)) %>%
+  identify_outliers(value) %>%
+  ungroup() %>%
+  mutate(scope = paste(conference, "only"))
+
+player_outliers <- bind_rows(outliers_league, outliers_conf) %>%
+  mutate(direction = if_else(value > group_median, "High", "Low"))
+
+player_outliers %>%
+  arrange(measure, scope, desc(value)) %>%
+  mutate(measure = measure_labels[as.character(measure)],
+         value   = number(value, accuracy = 0.01),
+         level   = if_else(is.extreme, "Extreme", "Outlier")) %>%
+  select(measure, scope, player, team, value, direction, level) %>%
+  fu_table(col.names = c("Measure", "Compared with", "Player", "Team", "Value",
+                         "Direction", "Level"))
+```
+
+**Inferential: Poisson rate tests.** For each striker, an exact two-sided
+Poisson test of non-penalty goals over 90-minute units against a reference
+rate: the pooled rate of all other qualifying strikers (league), and the pooled
+rate of all other qualifying strikers in the same conference (conference). The
+player is left out of his own reference so he is not compared partly with
+himself. P-values adjusted with Benjamini–Hochberg across the 55 strikers,
+separately for each comparison.
+
+```{r player-poisson}
+rate_tests <- strikers %>%
+  mutate(league_rate = (sum(npg) - npg) / (sum(n90) - n90)) %>%
+  mutate(conf_rate   = (sum(npg) - npg) / (sum(n90) - n90), .by = conference) %>%
+  rowwise() %>%
+  mutate(p_league = poisson.test(npg, n90, r = league_rate)$p.value,
+         p_conf   = poisson.test(npg, n90, r = conf_rate)$p.value) %>%
+  ungroup() %>%
+  mutate(p_league_adj = p.adjust(p_league, method = "BH"),
+         p_conf_adj   = p.adjust(p_conf,   method = "BH"))
+
+rate_tests %>%
+  arrange(p_league) %>%
+  slice_head(n = 8) %>%
+  mutate(across(c(npg90, league_rate, conf_rate), ~ number(.x, accuracy = 0.01)),
+         n90 = number(n90, accuracy = 0.1),
+         across(c(p_league, p_league_adj, p_conf, p_conf_adj), ~ pvalue(.x, accuracy = 0.001))) %>%
+  select(player, conference, npg, n90, npg90, league_rate, p_league, p_league_adj,
+         conf_rate, p_conf, p_conf_adj) %>%
+  fu_table(col.names = c("Player", "Conf.", "npG", "90s", "npG/90",
+                         "League rate", "p", "p.adj (BH)",
+                         "Conf. rate", "p", "p.adj (BH)"))
+
+rate_tests %>%
+  summarise(sig_league_high = sum(p_league_adj < 0.05 & npg90 > league_rate),
+            sig_league_low  = sum(p_league_adj < 0.05 & npg90 < league_rate),
+            sig_conf_high   = sum(p_conf_adj   < 0.05 & npg90 > conf_rate),
+            sig_conf_low    = sum(p_conf_adj   < 0.05 & npg90 < conf_rate)) %>%
+  fu_table(col.names = c("Above league", "Below league",
+                         "Above conference", "Below conference"))
+```
+
+### Players vs. their own xG
+
+Same exact Poisson test, with non-penalty goals against non-penalty xG. The
+reference ratio is the qualifying-striker pool's npG / npxG (0.90), not 1, so
+each striker is measured against how strikers as a group finished in 2025
+rather than against a model the whole league ran below (see the note on xG
+below).
+
+```{r player-vs-xg}
+pool_ratio <- sum(strikers$npg) / sum(strikers$npxg)
+
+xg_tests <- strikers %>%
+  rowwise() %>%
+  mutate(p_xg = poisson.test(npg, npxg, r = pool_ratio)$p.value) %>%
+  ungroup() %>%
+  mutate(p_xg_adj = p.adjust(p_xg, method = "BH"))
+
+xg_tests %>%
+  arrange(p_xg) %>%
+  slice_head(n = 6) %>%
+  mutate(ratio = number(npg / npxg, accuracy = 0.01),
+         npxg  = number(npxg, accuracy = 0.1),
+         across(c(p_xg, p_xg_adj), ~ pvalue(.x, accuracy = 0.001))) %>%
+  select(player, team, npg, npxg, ratio, p_xg, p_xg_adj) %>%
+  fu_table(col.names = c("Player", "Team", "npG", "npxG", "npG / npxG", "p", "p.adj (BH)"))
+```
+
+Summary. One striker differs significantly from both the league and his
+conference: Lionel Messi (league p.adj < 0.001; East p.adj < 0.001). Milan
+Iloski is an extreme outlier within the East on npG/90 but played 1,240
+minutes, and his rate test does not survive correction (league p.adj = 0.145).
+No striker scored significantly below the league or conference rate. No
+striker's non-penalty goals differ significantly from his own xG after
+correction (lowest p.adj = 0.817).
+
+
+### Players vs. their team context
+
+Does any striker score more than his team's performance would predict? Two
+definitions of team performance, fitted separately:
+
+- **A. Teammates' chance creation**: non-penalty xG per game created by the
+  rest of the team, with the striker's own npxG subtracted so he does not set
+  his own baseline.
+- **B. Team results**: team points per game.
+
+For each, a negative binomial regression of non-penalty goals on the team
+measure, with log(90-minute units) as an offset. Negative binomial rather than
+Poisson because striker goal counts are overdispersed (Pearson dispersion
+1.44 under Poisson for model A). Each striker's expected total comes from a
+model fitted to the other strikers (leave-one-out), so an extreme player does
+not shift his own baseline. The observed total is compared with that
+expectation using a two-sided exact test under the fitted negative binomial,
+BH-adjusted across strikers.
+
+Strikers who played for two teams in 2025 (3 of 55) are excluded: their xG
+cannot be separated from team totals by team in this dataset.
+
+```{r team-context-data}
+teams_2025 <- readr::read_csv("data/mls-teams-2025.csv", show_col_types = FALSE) %>%
+  mutate(team_npg  = goals_for - pen_goals_for,
+         team_npxg = xg_for - pen_xg_for,
+         ppg       = points / games)
+
+team_ctx <- strikers %>%
+  filter(n_teams == 1) %>%
+  left_join(teams_2025 %>% select(team, games, team_npg, team_npxg, ppg), by = "team") %>%
+  mutate(rest_npxg_pg = (team_npxg - npxg) / games,
+         share_npg    = npg / team_npg)
+
+stopifnot(!any(is.na(team_ctx$team_npxg)))
+
+team_ctx %>%
+  summarise(strikers = n(),
+            across(c(rest_npxg_pg, ppg),
+                   list(min = min, median = median, max = max))) %>%
+  mutate(across(-strikers, ~ number(.x, accuracy = 0.01))) %>%
+  fu_table(col.names = c("Strikers", "Teammate npxG/game: min", "median", "max",
+                         "Team points/game: min", "median", "max"))
+```
+
+```{r team-context-models}
+nb_fit <- function(df, context) {
+  f <- if (context == "A") npg ~ log(rest_npxg_pg) + offset(log(n90))
+       else                npg ~ ppg + offset(log(n90))
+  MASS::glm.nb(f, data = df)
+}
+
+tibble(context = c("A. Teammates' npxG per game (log)", "B. Team points per game"),
+       fit     = list(nb_fit(team_ctx, "A"), nb_fit(team_ctx, "B"))) %>%
+  mutate(coef = map(fit, ~ broom::tidy(.x) %>% filter(term != "(Intercept)")),
+         theta = map_dbl(fit, "theta")) %>%
+  unnest(coef) %>%
+  transmute(context,
+            rate_ratio = number(exp(estimate), accuracy = 0.01),
+            estimate   = number(estimate, accuracy = 0.001),
+            std.error = number(std.error, accuracy = 0.001),
+            statistic = number(statistic, accuracy = 0.01),
+            p.value   = pvalue(p.value, accuracy = 0.001),
+            theta     = number(theta, accuracy = 0.1)) %>%
+  select(context, estimate, rate_ratio, std.error, statistic, p.value, theta) %>%
+  fu_table(col.names = c("Team context", "Coefficient", "Rate ratio", "SE", "z", "p", "θ"))
+```
+
+Rate ratio: the multiplier on a striker's expected scoring rate per one-unit
+increase in the team measure (for A, per one-unit increase in log teammate
+npxG, i.e. multiplying teammate npxG by e ≈ 2.7).
+
+```{r team-context-tests}
+nb_p <- function(x, mu, theta) {
+  lower <- pnbinom(x, size = theta, mu = mu)
+  upper <- pnbinom(x - 1, size = theta, mu = mu, lower.tail = FALSE)
+  min(1, 2 * min(lower, upper))
+}
+
+loo_expected <- function(df, context) {
+  map_dfr(seq_len(nrow(df)), function(i) {
+    fit <- suppressWarnings(nb_fit(df[-i, ], context))
+    tibble(expected = unname(predict(fit, newdata = df[i, ], type = "response")),
+           theta    = fit$theta)
+  })
+}
+
+context_tests <- map_dfr(c("A", "B"), function(ctx) {
+  team_ctx %>%
+    bind_cols(loo_expected(team_ctx, ctx)) %>%
+    mutate(p = pmap_dbl(list(npg, expected, theta), nb_p),
+           p.adj = p.adjust(p, method = "BH"),
+           context = ctx)
+})
+
+context_tests %>%
+  select(context, player, team, npg, expected, p, p.adj) %>%
+  pivot_wider(names_from = context, values_from = c(expected, p, p.adj)) %>%
+  arrange(p_A) %>%
+  slice_head(n = 8) %>%
+  mutate(across(starts_with("expected"), ~ number(.x, accuracy = 0.1)),
+         across(matches("^p(\\.adj)?_"), ~ pvalue(.x, accuracy = 0.001))) %>%
+  select(player, team, npg, expected_A, p_A, p.adj_A, expected_B, p_B, p.adj_B) %>%
+  fu_table(col.names = c("Player", "Team", "npG",
+                         "Expected (A)", "p", "p.adj (BH)",
+                         "Expected (B)", "p", "p.adj (BH)"))
+
+context_tests %>%
+  group_by(context) %>%
+  summarise(above = sum(p.adj < 0.05 & npg > expected),
+            below = sum(p.adj < 0.05 & npg < expected)) %>%
+  fu_table(col.names = c("Team context", "Significantly above expected",
+                         "Significantly below expected"))
+```
+
+Some leave-one-out fits reach the iteration limit when estimating θ. This
+happens when the remaining data are close to Poisson (θ large), where the
+negative binomial converges to the Poisson. The Poisson version of the same
+tests identifies the same single striker (Messi; p.adj = 0.001 for A, 0.010
+for B).
+
+**Share of team goals.** Descriptive only: each striker's non-penalty goals as
+a share of his team's non-penalty goals.
+
+```{r team-share}
+team_ctx %>%
+  arrange(desc(share_npg)) %>%
+  slice_head(n = 10) %>%
+  mutate(share_npg = percent(share_npg, accuracy = 1)) %>%
+  select(player, team, npg, team_npg, share_npg) %>%
+  fu_table(col.names = c("Player", "Team", "npG", "Team npG", "Share"))
+```
+
+
+## The gap
+
+Non-penalty goals, attacking players, 900+ minutes. No player at any other
+position scored more than 9 non-penalty goals in 2025 (ASA, all positions,
+same query), so this ranking holds league-wide.
+
+```{r gap}
+npg_rank <- attackers %>%
+  filter(minutes >= MIN_MINUTES) %>%
+  arrange(desc(npg)) %>%
+  mutate(rank = min_rank(desc(npg)))
+
+npg_rank %>%
+  slice_head(n = 6) %>%
+  select(rank, player, position, team, age, npg, goals) %>%
+  fu_table(col.names = c("#", "Player", "Pos.", "Team", "Age", "npG", "G"))
+
+first  <- npg_rank$npg[1]
+second <- npg_rank$npg[2]
+gap    <- first - second
+
+# Every player within less than one gap of second place
+below_second <- npg_rank %>% filter(npg > second - gap)
+last_rank    <- nrow(below_second)
+last_npg     <- min(below_second$npg)
+
+striker_median_npg90 <- median(strikers$npg90)
+messi_npg90 <- strikers %>% filter(player == "Lionel Messi") %>% pull(npg90)
+
+cat(sprintf(paste0(
+  "Ranks 1 to 2: %d to %d npG, %d apart.\n",
+  "Ranks 2 to %d: %d to %d npG, %d apart.\n",
+  "Messi npG/90: %.2f. Striker median npG/90: %.2f (%.1fx).\n"),
+  first, second, gap,
+  last_rank, second, last_npg, second - last_npg,
+  messi_npg90, striker_median_npg90, messi_npg90 / striker_median_npg90))
+```
+
+Strikers only, as shown in the hero chart (top 15).
+
+```{r gap-strikers}
+striker_top15 <- strikers %>% slice_max(npg, n = 15, with_ties = FALSE)
+
+cat(sprintf("Strikers, ranks 1 to 2: %d to %d npG. Ranks 2 to 15: %d to %d npG, %d apart.\n",
+            striker_top15$npg[1], striker_top15$npg[2],
+            striker_top15$npg[2], striker_top15$npg[15],
+            striker_top15$npg[2] - striker_top15$npg[15]))
+```
+
+
+## A note on expected goals in 2025
+
+Across every MLS player, 2025 produced 1,355 non-penalty goals from 1,519
+non-penalty xG, a ratio of 0.89. For 2019 and 2021–2024 the same ratio was
+0.94, 0.99, 1.03, 0.995, and 1.02 (ASA API, same query by season, retrieved
+2026-09-25). Either scoring fell short of chance quality league-wide in 2025,
+or the shot model's calibration shifted. The data does not distinguish between
+the two. Goals-minus-xG comparisons in this notebook are therefore relative to
+a league that ran 11% below its own model, and are not used for the published
+finding.
+
+```{r finishing}
+strikers %>%
+  summarise(strikers = n(), below_npxg = sum(npg < npxg),
+            npg = sum(npg), npxg = sum(npxg)) %>%
+  relocate(below_npxg, .after = npxg) %>%
+  mutate(npxg = round(npxg), ratio = number(npg / npxg, accuracy = 0.01)) %>%
+  fu_table(col.names = c("Strikers", "npG", "npxG", "Below own npxG", "npG / npxG"))
+```
+
+
+## Predictors of over- and underperformance
+
+### Outcome
+
+A player overperforms when non-penalty goals per 90 exceed non-penalty xG per
+90 (ratio > 1), and underperforms when the ratio is below 1. Both rates share
+the same denominator (90-minute units), so the ratio reduces to npG / npxG and
+the outcome is equivalent to npG > npxG.
+
+The pool is every striker, winger, and attacking midfielder with 900+ minutes.
+Position enters as a predictor. Strikers alone are fitted as a sensitivity
+check.
+
+Because the league as a whole ran at 0.89 goals per non-penalty xG in 2025
+(see the note above), a threshold of 1 classifies most players as
+underperforming.
+
+```{r enet-outcome}
+model_pool <- attackers %>%
+  filter(minutes >= MIN_MINUTES) %>%
+  mutate(
+    over          = as.integer(npg > npxg),
+    west          = as.integer(conference == "West"),
+    multi_team    = as.integer(n_teams > 1),
+    np_shots90    = np_shots / n90,
+    npxg_per_shot = npxg / np_shots,
+    pen_shots90   = pen_shots / n90,
+    key_passes90  = key_passes / n90,
+    assists90     = assists / n90,
+    xa90          = xa / n90,
+    pos_W         = as.integer(position == "W"),
+    pos_AM        = as.integer(position == "AM")
+  )
+
+model_pool %>%
+  group_by(position) %>%
+  summarise(players = n(), under = sum(over == 0), over = sum(over)) %>%
+  relocate(under, .after = over) %>%
+  bind_rows(summarise(., position = "All", across(c(players, over, under), sum))) %>%
+  fu_table(col.names = c("Position", "Players", "Overperforming", "Underperforming"))
+```
+
+### Predictors
+
+Every variable in the dataset that does not contain the outcome. Volume
+measures are expressed per 90.
+
+| Predictor | Definition |
+|---|---|
+| `age` | Age at the 2025 season opener |
+| `minutes` | Regular-season minutes |
+| `west` | Primary team in the Western Conference |
+| `multi_team` | Played for more than one team |
+| `np_shots90` | Non-penalty shots per 90 |
+| `npxg_per_shot` | Average non-penalty xG per shot (shot quality) |
+| `sot_pct` | Share of all shots on target |
+| `pen_shots90` | Penalty attempts per 90 |
+| `key_passes90`, `assists90`, `xa90` | Chance creation for teammates, per 90 |
+| `pos_W`, `pos_AM` | Winger, attacking midfielder (reference: striker) |
+
+Excluded because they contain the outcome: goals, npG, npG/90, npxG/90,
+conversion rate (npG per non-penalty shot), and g+ (its shooting component
+credits goals scored). `npxg90` is also the product of `np_shots90` and
+`npxg_per_shot`, so it is represented by those two. Penalty goals and penalty
+xG are left out as near-duplicates of penalty attempts. Team identity (30
+levels for 153 players) is left out; conference stands in for it.
+
+`sot_pct` is partly mechanical: every goal is a shot on target. Models are
+reported with and without it.
+
+```{r enet-predictors}
+predictors_all <- c("age", "minutes", "west", "multi_team", "np_shots90",
+                    "npxg_per_shot", "sot_pct", "pen_shots90",
+                    "key_passes90", "assists90", "xa90", "pos_W", "pos_AM")
+
+model_pool %>%
+  select(all_of(predictors_all)) %>%
+  cor() %>%
+  as_tibble(rownames = "predictor") %>%
+  pivot_longer(-predictor, names_to = "with", values_to = "r") %>%
+  filter(predictor < with, abs(r) >= 0.5) %>%
+  arrange(desc(abs(r))) %>%
+  mutate(r = number(r, accuracy = 0.01)) %>%
+  fu_table(col.names = c("Predictor", "With", "Pearson r"))
+```
+
+The chance-creation measures are correlated with one another. The elastic net
+mixing penalty is chosen for this reason: the ridge component shares weight
+across correlated predictors, and the lasso component sets weak ones to zero.
+
+### Model
+
+Penalised logistic regression (`glmnet`), predictors standardised to mean 0 and
+SD 1 so coefficients are comparable. The mixing parameter α is fixed at 0.5.
+The penalty strength λ is chosen by 5-fold cross-validation.
+
+Performance is measured by area under the ROC curve (AUC; 0.5 is chance),
+estimated by nested cross-validation: λ is tuned inside each training fold and
+AUC is scored only on the held-out fold, repeated 20 times. Cross-validated
+AUC on shuffled labels sits below 0.5 in small samples, so each model is
+compared with 100 permutations of the outcome rather than with 0.5.
+
+```{r enet-functions}
+library(glmnet)
+
+ALPHA <- 0.5
+
+standardise <- function(df, preds) {
+  df %>% select(all_of(preds)) %>% mutate(across(everything(), ~ as.numeric(scale(.x)))) %>% as.matrix()
+}
+
+auc <- function(y, p) {
+  r  <- rank(p)
+  n1 <- sum(y)
+  n0 <- length(y) - n1
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+nested_auc <- function(X, y, reps = 20, seed = 1) {
+  map_dbl(seq_len(reps), function(r) {
+    set.seed(seed + r)
+    outer <- sample(rep(1:5, length.out = length(y)))
+    p <- numeric(length(y))
+    for (k in 1:5) {
+      train <- outer != k
+      cv <- cv.glmnet(X[train, ], y[train], family = "binomial", alpha = ALPHA, nfolds = 5)
+      p[!train] <- predict(cv, X[!train, , drop = FALSE], s = "lambda.min", type = "response")
+    }
+    auc(y, p)
+  }) %>% mean()
+}
+
+permutation_test <- function(X, y, B = 100) {
+  observed <- nested_auc(X, y)
+  null <- map_dbl(seq_len(B), function(b) {
+    set.seed(1000 + b)
+    nested_auc(X, sample(y), reps = 2, seed = b)
+  })
+  tibble(auc = observed, null_mean = mean(null),
+         null_95 = unname(quantile(null, 0.95)),
+         p = (1 + sum(null >= observed)) / (B + 1))
+}
+```
+
+```{r enet-fit}
+model_strikers <- model_pool %>% filter(position == "ST")
+predictors_st  <- setdiff(predictors_all, c("pos_W", "pos_AM"))
+
+configs <- tribble(
+  ~pool,       ~predictors,                       ~data,
+  "Attackers", "All",                             list(model_pool),
+  "Attackers", "Without SoT%",                    list(model_pool),
+  "Strikers",  "All",                             list(model_strikers),
+  "Strikers",  "Without SoT%",                    list(model_strikers)
+) %>%
+  mutate(
+    preds = list(predictors_all, setdiff(predictors_all, "sot_pct"),
+                 predictors_st,  setdiff(predictors_st,  "sot_pct")),
+    data  = map(data, 1)
+  )
+
+enet_results <- configs %>%
+  mutate(
+    n      = map_int(data, nrow),
+    over   = map_int(data, ~ sum(.x$over)),
+    result = map2(data, preds, ~ permutation_test(standardise(.x, .y), .x$over))
+  ) %>%
+  unnest(result)
+
+enet_results %>%
+  transmute(pool, predictors, n, over,
+            auc       = number(auc, accuracy = 0.01),
+            null_mean = number(null_mean, accuracy = 0.01),
+            null_95   = number(null_95, accuracy = 0.01),
+            p         = number(p, accuracy = 0.01)) %>%
+  fu_table(col.names = c("Pool", "Predictors", "n", "Over", "Nested-CV AUC",
+                         "Permuted AUC (mean)", "Permuted AUC (95th pct)", "Permutation p"))
+```
+
+### Which predictors
+
+Coefficients at the cross-validated λ for the full attacker pool, and how often
+each predictor is retained across 200 bootstrap resamples (λ re-tuned in
+each). Coefficients are on the standardised scale: the change in log-odds of
+overperforming per one-SD increase. A dot means the predictor was set to zero.
+
+Selection at λ.min is permissive. Predictors with no relationship to the
+outcome are still retained in roughly 40–55% of resamples here, so only
+frequencies near 100% separate from that background.
+
+```{r enet-bootstrap}
+bootstrap_selection <- function(df, preds, B = 200) {
+  X <- standardise(df, preds)
+  y <- df$over
+  map_dfr(seq_len(B), function(b) {
+    set.seed(b)
+    i  <- sample(nrow(X), replace = TRUE)
+    cv <- cv.glmnet(X[i, ], y[i], family = "binomial", alpha = ALPHA, nfolds = 5)
+    cf <- as.matrix(coef(cv, s = "lambda.min"))[-1, 1]
+    tibble(predictor = names(cf), coef = cf)
+  }) %>%
+    group_by(predictor) %>%
+    summarise(selected = mean(coef != 0),
+              positive = mean(coef > 0),
+              negative = mean(coef < 0))
+}
+
+full_coefs <- function(df, preds) {
+  set.seed(1)
+  cv <- cv.glmnet(standardise(df, preds), df$over, family = "binomial",
+                  alpha = ALPHA, nfolds = 5)
+  cf <- as.matrix(coef(cv, s = "lambda.min"))[-1, 1]
+  tibble(predictor = names(cf), coef = cf)
+}
+
+selection <- bind_rows(
+  full_coefs(model_pool, predictors_all) %>%
+    left_join(bootstrap_selection(model_pool, predictors_all), by = "predictor") %>%
+    mutate(model = "With SoT%"),
+  full_coefs(model_pool, setdiff(predictors_all, "sot_pct")) %>%
+    left_join(bootstrap_selection(model_pool, setdiff(predictors_all, "sot_pct")), by = "predictor") %>%
+    mutate(model = "Without SoT%")
+)
+
+selection %>%
+  select(predictor, model, coef, selected) %>%
+  pivot_wider(names_from = model, values_from = c(coef, selected)) %>%
+  arrange(desc(`selected_With SoT%`)) %>%
+  mutate(across(starts_with("coef"), ~ if_else(.x == 0 | is.na(.x), "·", number(.x, accuracy = 0.001))),
+         across(starts_with("selected"), ~ if_else(is.na(.x), "–", percent(.x, accuracy = 1)))) %>%
+  select(predictor, `coef_With SoT%`, `selected_With SoT%`,
+         `coef_Without SoT%`, `selected_Without SoT%`) %>%
+  fu_table(col.names = c("Predictor", "Coef. (with SoT%)", "Bootstrap selected",
+                         "Coef. (without SoT%)", "Bootstrap selected"))
+```
+
+```{r enet-plot, fig.width=7, fig.height=5}
+selection %>%
+  mutate(direction = if_else(positive >= negative, "Toward overperforming", "Toward underperforming"),
+         predictor = fct_reorder(predictor, selected, .fun = max)) %>%
+  ggplot(aes(selected, predictor, fill = direction)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~model, ncol = 2) +
+  scale_x_continuous(labels = percent, limits = c(0, 1)) +
+  scale_fill_manual(values = c(`Toward overperforming` = "#007bc6",
+                               `Toward underperforming` = "#69279b")) +
+  labs(title = "Bootstrap selection frequency, elastic net (α = 0.5)",
+       subtitle = "Attackers, 900+ minutes, 200 resamples. Color: sign of the coefficient",
+       x = "Share of resamples retaining the predictor", y = NULL, fill = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom", panel.grid.major.y = element_blank())
+```
+
+```{r enet-position-check}
+model_pool %>%
+  group_by(position) %>%
+  summarise(players = n(), npg = sum(npg), npxg = sum(npxg),
+            key_passes90 = median(key_passes90)) %>%
+  mutate(ratio = number(npg / npxg, accuracy = 0.01),
+         npxg = round(npxg),
+         key_passes90 = number(key_passes90, accuracy = 0.01)) %>%
+  select(position, players, npg, npxg, ratio, key_passes90) %>%
+  fu_table(col.names = c("Position", "Players", "npG", "npxG", "npG / npxG", "Median key passes / 90"))
+```
+
+### Result
+
+With shots-on-target rate included, the attacker model separates over- from
+underperformers moderately (nested-CV AUC 0.70; permutation p = 0.01).
+Shots-on-target rate carries most of that, and it is partly the outcome
+restated: goals are a subset of shots on target.
+
+Without it, performance drops to AUC 0.57 (p = 0.03). Two predictors are
+retained in nearly every resample, both positive: playing as an attacking
+midfielder, and key passes per 90. The two overlap. Attacking midfielders
+make the most key passes, and as a group they scored 26% above their npxG in
+2025 while strikers and wingers finished 10–13% below. In a season where the
+league as a whole ran 11% below its model, the position effect cannot be
+separated from how the xG model treats the shots attacking midfielders take.
+
+Among strikers alone, no predictor set does better than shuffled labels once
+shots-on-target rate is removed (AUC 0.36; p = 0.61). Age, conference, minutes,
+shot volume, shot quality, penalty duty, and chance creation do not
+distinguish strikers who beat their xG from strikers who did not.
+
+
+
+## Candidate plots
+
+Exploration versions. Final styling is applied in `render.R`.
+
+### A. The gap: non-penalty goals, top 20 strikers
+
+```{r plot-gap, fig.width=7, fig.height=6}
+strikers %>%
+  slice_max(npg, n = 20, with_ties = FALSE) %>%
+  mutate(player = fct_reorder(player, npg)) %>%
+  ggplot(aes(npg, player, color = conference)) +
+  geom_segment(aes(x = 0, xend = npg, yend = player), linewidth = 0.4, color = "#ECECEC") +
+  geom_point(size = 3) +
+  scale_color_manual(values = conf_colors) +
+  scale_x_continuous(breaks = seq(0, 30, 5), limits = c(0, 30)) +
+  labs(title = "Non-penalty goals, 2025 regular season",
+       subtitle = "Top 20 strikers, 900+ minutes", x = NULL, y = NULL, color = NULL) +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+```
+
+### B. Chances vs. goals: npxG against npG
+
+```{r plot-xg-scatter, fig.width=7, fig.height=6}
+strikers %>%
+  ggplot(aes(npxg, npg, color = conference)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#676767") +
+  geom_point(size = 2.5, alpha = 0.85) +
+  geom_text_repel(data = ~ filter(.x, npg >= 13 | npxg >= 15),
+                  aes(label = player), size = 3, color = "#282828", seed = 1) +
+  scale_color_manual(values = conf_colors) +
+  coord_equal(xlim = c(0, 30), ylim = c(0, 30)) +
+  labs(title = "Non-penalty goals vs. non-penalty xG",
+       subtitle = "Strikers, 900+ minutes. Dashed line: goals equal xG",
+       x = "npxG", y = "npG", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### C. East and West top ten, penalties shown
+
+```{r plot-conf-top10, fig.width=7, fig.height=7}
+strikers %>%
+  group_by(conference) %>%
+  arrange(desc(goals), desc(assists), minutes, .by_group = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  select(player, conference, goals, npg, pen_goals) %>%
+  pivot_longer(c(npg, pen_goals), names_to = "type", values_to = "n") %>%
+  mutate(type = factor(type, levels = c("pen_goals", "npg"),
+                       labels = c("Penalty", "Non-penalty")),
+         player = fct_reorder(player, goals)) %>%
+  ggplot(aes(n, player, fill = type)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~conference, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = c(Penalty = "#ECECEC", `Non-penalty` = "#3551b1")) +
+  labs(title = "Top ten strikers by conference", x = "Goals", y = NULL, fill = NULL) +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_blank(), legend.position = "bottom")
+```
+
+### D. Age and scoring rate
+
+```{r plot-age, fig.width=7, fig.height=5}
+strikers %>%
+  ggplot(aes(age, npg90, color = conference)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  geom_text_repel(data = ~ filter(.x, age >= 33 | npg90 >= 0.6),
+                  aes(label = player), size = 3, color = "#282828", seed = 1) +
+  scale_color_manual(values = conf_colors) +
+  labs(title = "Age at season start vs. non-penalty goals per 90",
+       subtitle = "Strikers, 900+ minutes", x = "Age", y = "npG per 90", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### E. Per 90: non-penalty goals vs. xG, by conference
+
+Each conference's top ten by goals (as in the tables above), plus the overall
+top ten. Rows are sorted by non-penalty goals per 90.
+
+```{r plot-per90-dumbbell, fig.width=10, fig.height=6}
+per90_panels <- bind_rows(
+  strikers %>% filter(conference == "East") %>% arrange(desc(goals), desc(assists), minutes) %>% slice_head(n = 10) %>% mutate(panel = "East"),
+  strikers %>% filter(conference == "West") %>% arrange(desc(goals), desc(assists), minutes) %>% slice_head(n = 10) %>% mutate(panel = "West"),
+  strikers %>% arrange(desc(goals), desc(assists), minutes) %>% slice_head(n = 10) %>% mutate(panel = "Overall")
+) %>%
+  mutate(panel = factor(panel, levels = c("East", "West", "Overall"))) %>%
+  group_by(panel) %>%
+  arrange(desc(npg90), .by_group = TRUE) %>%
+  mutate(y = rev(row_number())) %>%
+  ungroup()
+
+per90_panels %>%
+  ggplot(aes(y = y)) +
+  geom_segment(aes(x = npxg90, xend = npg90, yend = y), color = "#BDBDBD", linewidth = 0.8) +
+  geom_point(aes(x = npxg90), shape = 21, size = 2.5, stroke = 1, fill = "white", color = "#282828") +
+  geom_point(aes(x = npg90), size = 2.7, color = "#007bc6") +
+  geom_text(aes(x = 0.02, label = sprintf("%s  %.2f vs %.2f", player, npg90, npxg90)),
+            hjust = 0, vjust = -0.9, size = 2.6, color = "#282828") +
+  facet_wrap(~panel, ncol = 3) +
+  scale_x_continuous(limits = c(0, 1.05), breaks = c(0.1, 0.5, 0.9)) +
+  scale_y_continuous(expand = expansion(add = c(0.5, 0.9))) +
+  labs(title = "Top ten strikers, per 90 minutes",
+       subtitle = "Filled: npG per 90. Ring: npxG per 90.", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank())
+
+per90_panels %>%
+  group_by(panel) %>%
+  summarise(above_xg = sum(npg90 > npxg90), below_xg = sum(npg90 < npxg90)) %>%
+  fu_table(col.names = c("Panel", "npG/90 above npxG/90", "Below"))
+```
+
+
+### F. Funnel plot (hero)
+
+Non-penalty goals per 90 against minutes played for all 55 qualifying strikers.
+Control limits are exact Poisson 95% and 99.8% limits around the pooled striker
+rate, smoothed between integer counts (Spiegelhalter 2005). The limits are not
+adjusted for multiple comparisons; the BH-adjusted rate tests above are the
+formal result.
+
+```{r funnel-limits}
+funnel_rate <- sum(strikers$npg) / sum(strikers$n90)
+
+poisson_limit <- function(p, mu) {
+  x <- qpois(p, mu)
+  a <- (ppois(x, mu) - p) / dpois(x, mu)
+  pmax(x - a, 0)
+}
+
+funnel <- tibble(n90 = seq(900, 3650, by = 5) / 90) %>%
+  mutate(mu    = funnel_rate * n90,
+         lo95  = poisson_limit(0.025, mu) / n90,
+         hi95  = poisson_limit(0.975, mu) / n90,
+         lo998 = poisson_limit(0.001, mu) / n90,
+         hi998 = poisson_limit(0.999, mu) / n90)
+
+funnel_strikers <- strikers %>%
+  mutate(hi998 = poisson_limit(0.999, funnel_rate * n90) / n90,
+         hi95  = poisson_limit(0.975, funnel_rate * n90) / n90,
+         lo95  = poisson_limit(0.025, funnel_rate * n90) / n90,
+         zone  = case_when(npg90 > hi998 ~ "Above 99.8%",
+                           npg90 > hi95  ~ "Between 95% and 99.8%",
+                           npg90 < lo95  ~ "Below 95%",
+                           TRUE          ~ "Inside 95%"))
+
+funnel_strikers %>%
+  count(zone) %>%
+  fu_table(col.names = c("Zone", "Strikers"))
+
+funnel_strikers %>%
+  filter(zone != "Inside 95%") %>%
+  arrange(desc(npg90)) %>%
+  mutate(npg90 = number(npg90, accuracy = 0.01), minutes = comma(minutes)) %>%
+  select(player, team, minutes, npg, npg90, zone) %>%
+  fu_table(col.names = c("Player", "Team", "Minutes", "npG", "npG/90", "Zone"))
+```
+
+With 55 strikers, about 1.4 would fall above the 95% line by chance alone
+(2.5% each side). Five do: four between the 95% and 99.8% lines, and one
+above 99.8%. None falls below the lower 95% line.
+
+```{r plot-funnel, fig.width=7, fig.height=6}
+ggplot() +
+  geom_ribbon(data = funnel, aes(n90 * 90, ymin = lo998, ymax = hi998), fill = "#eef4f5") +
+  geom_ribbon(data = funnel, aes(n90 * 90, ymin = lo95, ymax = hi95), fill = "#69279b", alpha = 0.14) +
+  geom_line(data = funnel, aes(n90 * 90, hi95), linetype = "dashed", color = "#676767") +
+  geom_line(data = funnel, aes(n90 * 90, lo95), linetype = "dashed", color = "#676767") +
+  geom_line(data = funnel, aes(n90 * 90, hi998), color = "#676767") +
+  geom_line(data = funnel, aes(n90 * 90, lo998), color = "#676767") +
+  geom_hline(yintercept = funnel_rate, color = "#676767") +
+  geom_point(data = funnel_strikers, aes(minutes, npg90,
+                                         fill = zone == "Above 99.8%"),
+             shape = 21, color = "#282828", size = 2.4, stroke = 0.35) +
+  geom_text_repel(data = filter(funnel_strikers, zone %in% c("Above 99.8%", "Between 95% and 99.8%")),
+                  aes(minutes, npg90, label = player), size = 3, seed = 1) +
+  scale_fill_manual(values = c(`TRUE` = "#007bc6", `FALSE` = "white"), guide = "none") +
+  coord_cartesian(xlim = c(900, 3650), ylim = c(0, 1.08)) +
+  labs(title = "Non-penalty goals per 90 by minutes played",
+       subtitle = "Strikers, 900+ minutes. Bands: exact Poisson 95% and 99.8% limits",
+       x = "Minutes played", y = "npG per 90") +
+  theme_minimal()
+```
+
+
+## Finding
+
+Of 55 MLS strikers with 900 or more regular-season minutes in 2025, one scored
+non-penalty goals at a rate outside the range expected by chance: Lionel
+Messi, 0.93 per 90 against a pooled rate of 0.37, beyond the 99.8% Poisson
+limit for his minutes. Four others fell between the 95% and 99.8% limits;
+none fell below. Messi's 28 non-penalty goals were nine more than any other
+player at any position. He is the only striker whose rate differs
+significantly from the league, from his own conference, and from what his
+team's performance predicts. Eastern and Western Conference strikers do not
+differ on any of eight measures.
+
+
+## Observations
+
+- On the funnel plot, one of 55 strikers falls above the 99.8% limit (Messi).
+  Four fall between the 95% and 99.8% limits (Iloski, Musovski, Baribo,
+  White); none falls below the lower 95% limit. About 1.4 would be expected
+  above the upper 95% limit by chance.
+- Lionel Messi scored 28 non-penalty goals (0.93 per 90). The next-highest
+  total at any position was 19. His rate was significantly above the rest of
+  the league (0.35 per 90; exact Poisson test, p.adj < 0.001) and the rest of
+  the Eastern Conference (0.37 per 90; p.adj < 0.001). No other striker
+  differed significantly from either reference.
+- He was 37 at the season opener, the second-oldest of 55 qualifying strikers.
+  Across those 55, age and non-penalty scoring rate were not related
+  (Spearman rho = 0.12, p = 0.39).
+- Eight of the ten top-scoring strikers played in the Eastern Conference. The
+  full pools do not differ on any measure: goals per 90 (W = 480,
+  p.adj = 0.320), non-penalty goals per 90 (W = 471, p.adj = 0.320),
+  non-penalty shots per 90 (W = 494, p.adj = 0.320), or the five others (all
+  p.adj ≥ 0.475). All effect sizes are small.
+- Milan Iloski (Philadelphia) is an extreme outlier within the East on
+  non-penalty goals per 90 (0.87) in 1,240 minutes. His rate test does not
+  survive correction (p.adj = 0.145).
+- No striker's non-penalty goal total differs significantly from his own xG
+  after correction (lowest p.adj = 0.817, Iloski: 12 goals from 6.1 xG).
+- Relative to team context, one striker scored significantly more than
+  expected: Messi, 28 non-penalty goals against 11.0 expected from his
+  teammates' chance creation (negative binomial, p.adj = 0.001) and 12.7
+  expected from his team's points per game (p.adj = 0.015). No striker scored
+  significantly below expectation under either definition.
+- Team results were associated with striker scoring: each additional point
+  per game was associated with a 1.61× higher non-penalty scoring rate
+  (z = 3.23, p = 0.001). Teammates' chance creation was not (rate ratio 1.47
+  per log unit, p = 0.177).
+- Sam Surridge scored 39% of Nashville's non-penalty goals, the largest share
+  of any striker's team total. Joveljic (36%, Kansas City) and Messi (35%,
+  Miami) followed.
+- Four of the top ten (Surridge, Joveljic, Choupo-Moting, A. Martínez) scored
+  five penalties each. Messi scored one.
+- Among qualifying strikers, no measured characteristic other than
+  shots-on-target rate predicted whether a striker scored above or below
+  expected (elastic net, nested-CV AUC 0.36 without it; permutation p = 0.61).
